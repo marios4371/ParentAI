@@ -1,16 +1,17 @@
 package com.example.user.user_microservice.controller;
 
 import com.example.user.user_microservice.dto.UserDTO;
+import com.example.user.user_microservice.model.User;
 import com.example.user.user_microservice.service.UserService;
 import lombok.AllArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 @RestController
 @RequestMapping("api/auth")
@@ -19,7 +20,7 @@ public class UserController {
 
     @Autowired
     private UserService userService;
-    private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
+    private final PasswordEncoder passwordEncoder;
 
     @PostMapping("/register")
     public ResponseEntity<?> saveUser(@RequestBody UserDTO userDto) {
@@ -30,7 +31,6 @@ public class UserController {
             if(userService.isUserPresent(userDto)){
                 return ResponseEntity.badRequest().body("User already exists!");
             }
-            userDto.setPassword(passwordEncoder.encode(userDto.getPassword()));
 
             UserDTO saved = userService.saveUser(userDto);
             return ResponseEntity.status(HttpStatus.CREATED).body(saved);
@@ -45,9 +45,12 @@ public class UserController {
         if (req.getEmail() == null || req.getPassword() == null) {
             return ResponseEntity.badRequest().body("Missing fields");
         }
-        UserDTO userDto = userService.findByEmail(req.getEmail());
-        if (userDto == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid credentials");
-        return ResponseEntity.ok(userDto);
+
+        User user = userService.authenticateAndMaybeMigrate(req.getEmail(), req.getPassword());
+        if (user == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid credentials");
+
+        UserDTO out = new UserDTO(user.getId(), user.getUsername(), null, user.getEmail());
+        return ResponseEntity.ok(out);
     }
 
 }

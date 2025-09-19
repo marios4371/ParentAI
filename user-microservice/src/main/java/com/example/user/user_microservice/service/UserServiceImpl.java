@@ -4,65 +4,64 @@ import com.example.user.user_microservice.dto.UserDTO;
 import com.example.user.user_microservice.dto.eventDTO.UserCreatedEvent;
 import com.example.user.user_microservice.model.User;
 import com.example.user.user_microservice.repository.UserRepository;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Optional;
+import java.util.regex.Pattern;
 
 @Service
-public class UserServiceImpl implements UserService{
+public class UserServiceImpl implements UserService {
 
-    @Autowired
-    UserRepository userRepository;
+    private final UserRepository userRepository;
+    private final KafkaTemplate<String, UserCreatedEvent> kafkaTemplate;
+    private final PasswordEncoder passwordEncoder;
+    private final BCryptPasswordEncoder legacyBcrypt = new BCryptPasswordEncoder();
+    private static final Pattern DELEGATING_PREFIX = Pattern.compile("^\\{[A-Za-z0-9_\\-]+\\}.*");
 
-    @Autowired
-    private KafkaTemplate<String, UserCreatedEvent> kafkaTemplate;
+    public UserServiceImpl(UserRepository userRepository,
+                           KafkaTemplate<String, UserCreatedEvent> kafkaTemplate,
+                           PasswordEncoder passwordEncoder) {
+        this.userRepository = userRepository;
+        this.kafkaTemplate = kafkaTemplate;
+        this.passwordEncoder = passwordEncoder;
+    }
 
     @Override
+    @Transactional
     public UserDTO saveUser(UserDTO userDto) {
-        User user = new User(
-                userDto.getId(),
-                userDto.getUsername(),
-                userDto.getEmail(),
-                userDto.getPassword()
-        );
+        String rawOrEncoded = userDto.getPassword().trim();
+        String hashed;
+        if (rawOrEncoded.startsWith("{") || rawOrEncoded.startsWith("$2a$") ||
+                rawOrEncoded.startsWith("$2b$") || rawOrEncoded.startsWith("$2y$")) {
+            hashed = rawOrEncoded; // assume already encoded
+        } else {
+            hashed = passwordEncoder.encode(rawOrEncoded);
+        }
 
+        User user = new User();
+        user.setUsername(userDto.getUsername());
+        user.setEmail(userDto.getEmail());
+        user.setPassword(hashed);
 
-        User savedUser = userRepository.save(user);
+        User saved = userRepository.save(user);
 
-        UserDTO savedUserDto = new UserDTO(
-                savedUser.getId(),
-                savedUser.getUsername(),
-                savedUser.getPassword(),
-                savedUser.getEmail()
-        );
+        UserCreatedEvent ev = new UserCreatedEvent();
+        ev.setId(saved.getId());
+        ev.setUsername(saved.getUsername());
+        ev.setEmail(saved.getEmail());
+        kafkaTemplate.send("users.created", String.valueOf(ev.getId()), ev);
 
-        UserCreatedEvent userCreatedEvent = new UserCreatedEvent();
-        userCreatedEvent.setId(savedUser.getId());
-        userCreatedEvent.setUsername(savedUser.getUsername());
-        userCreatedEvent.setEmail(savedUser.getEmail());
-
-        kafkaTemplate.send("users.created", String.valueOf(userCreatedEvent.getId()), userCreatedEvent)
-                .addCallback(
-                        result -> { /* success logging */ },
-                        ex -> { /* failure logging or retry */ }
-                );
-
-
-        return savedUserDto;
+        return new UserDTO(saved.getId(), saved.getUsername(), null, saved.getEmail());
     }
 
     @Override
     public boolean isUserPresent(UserDTO userDto) {
-        User currUser = new User(
-                userDto.getId(),
-                userDto.getUsername(),
-                userDto.getEmail(),
-                userDto.getPassword()
-        );
-        Optional<User> currUserDto = userRepository.findByUsername(currUser.getUsername());
-        return currUserDto.isPresent();
+        if (userDto == null) return false;
+        return userRepository.findByUsername(userDto.getUsername()).isPresent();
     }
 
     @Override
@@ -71,5 +70,47 @@ public class UserServiceImpl implements UserService{
         if (u.isEmpty()) return null;
         User user = u.get();
         return new UserDTO(user.getId(), user.getUsername(), null, user.getEmail());
+    }
+    @Transactional
+    public User authenticateAndMaybeMigrate(String email, String rawPassword) {
+        Optional<User> opt = userRepository.findByEmail(email);
+        if (opt.isEmpty()) return null;
+        User user = opt.get();
+
+        String stored = user.getPassword();
+        if (stored == null) return null;
+        stored = stored.trim();
+
+        if (stored.isEmpty()) return null;
+
+        if (DELEGATING_PREFIX.matcher(stored).matches()) {
+            try {
+                boolean ok = passwordEncoder.matches(rawPassword, stored);
+                return ok ? user : null;
+            } catch (Exception ex) {
+                return null;
+            }
+        }
+
+        if (stored.startsWith("$2a$") || stored.startsWith("$2b$") || stored.startsWith("$2y$")) {
+            boolean legacyOk = false;
+            try {
+                legacyOk = legacyBcrypt.matches(rawPassword, stored);
+            } catch (Exception ex) {
+                legacyOk = false;
+            }
+            if (!legacyOk) return null;
+
+            String newHash = passwordEncoder.encode(rawPassword);
+            user.setPassword(newHash);
+            userRepository.save(user);
+            return user;
+        }
+
+        try {
+            if (passwordEncoder.matches(rawPassword, stored)) return user;
+        } catch (Exception ignored) {}
+
+        return null;
     }
 }
