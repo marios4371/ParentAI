@@ -52,5 +52,5 @@ public class UserController {
         UserDTO out = new UserDTO(user.getId(), user.getUsername(), null, user.getEmail());
         return ResponseEntity.ok(out);
     }
-
+    //hello
 }
