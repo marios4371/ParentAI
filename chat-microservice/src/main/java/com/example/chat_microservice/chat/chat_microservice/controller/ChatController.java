@@ -3,6 +3,8 @@ package com.example.chat_microservice.chat.chat_microservice.controller;
 import com.example.chat_microservice.chat.chat_microservice.dto.ConversationDTO;
 import com.example.chat_microservice.chat.chat_microservice.dto.MessageDTO;
 import com.example.chat_microservice.chat.chat_microservice.service.ConversationService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -14,6 +16,7 @@ import java.util.Map;
 @CrossOrigin(origins = "http://localhost:5173")
 public class ChatController {
 
+    private Logger logger = LoggerFactory.getLogger(ChatController.class);
     private ConversationService conversationService;
 
     public ChatController(ConversationService conversationService) {
@@ -22,11 +25,14 @@ public class ChatController {
 
     @GetMapping("/conversations")
     public ResponseEntity<?> listConversations(@RequestHeader(value="X-User-Id", required=false) String userIdHeader) {
+        logger.info("GET /api/conversations called. X-User-Id header = {}", userIdHeader);
         try {
             Long userId = Long.valueOf(userIdHeader);
             List<ConversationDTO> list = conversationService.listConversations(userId);
+            logger.info("Returning {} conversations for userId={}", list.size(), userId);
             return ResponseEntity.ok(list);
         } catch (Exception e) {
+            logger.warn("listConversations failed: {}", e.getMessage());
             return ResponseEntity.badRequest().body(Map.of("error","invalid_or_missing_user_id"));
         }
     }

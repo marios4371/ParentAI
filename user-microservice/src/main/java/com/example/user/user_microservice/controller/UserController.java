@@ -49,7 +49,8 @@ public class UserController {
         User user = userService.authenticateAndMaybeMigrate(req.getEmail(), req.getPassword());
         if (user == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid credentials");
 
-        UserDTO out = new UserDTO(user.getId(), user.getUsername(), null, user.getEmail());
+        // FIX: return correct mapping (email in email field, password omitted)
+        UserDTO out = new UserDTO(user.getId(), user.getUsername(), user.getEmail(), null);
         return ResponseEntity.ok(out);
     }
 

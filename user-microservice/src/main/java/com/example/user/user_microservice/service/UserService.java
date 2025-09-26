@@ -9,5 +9,7 @@ public interface UserService {
     UserDTO findByEmail(String email);
     User authenticateAndMaybeMigrate(String email, String password);
 
+    UserDTO loginWithGoogleIdToken(String idToken);
+
 
 }

@@ -55,7 +55,10 @@ public class ConversationServiceImpl implements ConversationService {
 
     @Override
     public List<ConversationDTO> listConversations(Long userId) {
+        if (userId == null) throw new IllegalArgumentException("userId cannot be null");
+        logger.info("listConversations() called for userId={}", userId);
         List<Conversation> conversationList = conversationRepository.findByUserIdOrderByCreatedAtDesc(userId);
+        logger.info("conversationRepository returned {} rows for userId={}", conversationList.size(), userId);
         return conversationList.stream()
                 .map(ConversationMapper::toDto)
                 .collect(Collectors.toList());
@@ -182,10 +185,11 @@ public class ConversationServiceImpl implements ConversationService {
         if (userId == null) throw new IllegalArgumentException("userId must be provided");
         if (text == null || text.trim().isEmpty()) throw new IllegalArgumentException("empty message");
 
-        //if conversationId null -> create new
+        // if conversationId null -> create new
         Conversation conv = ensureConversation(userId, conversationId, null);
         if (!userId.equals(conv.getUserId())) throw new IllegalArgumentException("forbidden");
 
+        // 1) save user message
         Message userMsg = new Message("user", text, Instant.now());
         userMsg.setConversation(conv);
 
@@ -202,10 +206,10 @@ public class ConversationServiceImpl implements ConversationService {
             throw new RuntimeException("Database error saving message", dae);
         }
 
-        // 2) call python upstream (outside DB error handling). Parse reply robustly.
-        String botReply;
+        // 2) call python upstream and capture raw response
+        String rawUpstream;
         try {
-            botReply = callPython(text);
+            rawUpstream = callPython(text);
         } catch (RuntimeException e) {
             // mark user message as failed by appending tag (since no status field)
             try {
@@ -218,9 +222,44 @@ public class ConversationServiceImpl implements ConversationService {
             throw new RuntimeException("Upstream error: " + e.getMessage(), e);
         }
 
-        // 3) save bot message
-        Message botMsg = new Message("bot", botReply, Instant.now());
+        // 3) parse upstream, extract best candidate reply and metadata
+        String botText = rawUpstream;
+        String metadataJson = null;
+        String model = null;
+        try {
+            JsonNode root = objectMapper.readTree(rawUpstream);
+            // heuristics: pick known fields if present
+            if (root.has("reply")) {
+                botText = root.get("reply").asText();
+            } else if (root.has("hf_response") && root.get("hf_response").has("generated_text")) {
+                botText = root.get("hf_response").get("generated_text").asText();
+            } else if (root.has("generated_text")) {
+                botText = root.get("generated_text").asText();
+            } else {
+                // leave botText as rawUpstream (string)
+            }
+            // keep raw JSON as metadata
+            metadataJson = root.toString();
+
+            // optional model detection
+            if (root.has("model")) model = root.get("model").asText();
+            // also check nested structures
+            if (model == null && root.has("meta") && root.get("meta").has("model")) model = root.get("meta").get("model").asText();
+        } catch (Exception ex) {
+            // not JSON — raw text reply, metadata stays null
+            metadataJson = null;
+        }
+
+        // 4) save bot message including metadata
+        Message botMsg = new Message();
+        botMsg.setSender("bot");
+        botMsg.setText(botText);
+        botMsg.setCreatedAt(Instant.now());
         botMsg.setConversation(conv);
+        botMsg.setSource("python-service");
+        if (model != null) botMsg.setModel(model);
+        if (metadataJson != null) botMsg.setMetadata(metadataJson);
+
         Message savedBotMsg;
         try {
             savedBotMsg = messageRepository.save(botMsg);
@@ -228,6 +267,7 @@ public class ConversationServiceImpl implements ConversationService {
                 conv.getMessages().add(savedBotMsg);
                 conversationRepository.save(conv);
             }
+            logger.info("Saved bot message id={} for convId={} (userId={})", savedBotMsg.getId(), conv.getId(), userId);
         } catch (DataAccessException dae) {
             logger.error("DB error saving bot message for userId={}, convId={} : {}", userId, conv.getId(), dae.getMessage(), dae);
             throw new RuntimeException("Database error saving bot reply", dae);
