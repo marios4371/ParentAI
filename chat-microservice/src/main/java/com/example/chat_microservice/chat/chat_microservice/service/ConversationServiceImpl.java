@@ -1,23 +1,22 @@
 package com.example.chat_microservice.chat.chat_microservice.service;
 
 
+import com.example.chat_microservice.chat.chat_microservice.client.ParentAIClient;
 import com.example.chat_microservice.chat.chat_microservice.dto.ConversationDTO;
 import com.example.chat_microservice.chat.chat_microservice.dto.MessageDTO;
+import com.example.chat_microservice.chat.chat_microservice.dto.client.HFChatResponse;
 import com.example.chat_microservice.chat.chat_microservice.dto.eventDTO.ChatCreatedEvent;
 import com.example.chat_microservice.chat.chat_microservice.mapper.ConversationMapper;
 import com.example.chat_microservice.chat.chat_microservice.model.Conversation;
 import com.example.chat_microservice.chat.chat_microservice.model.Message;
 import com.example.chat_microservice.chat.chat_microservice.repository.ConversationRepository;
 import com.example.chat_microservice.chat.chat_microservice.repository.MessageRepository;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.AllArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
@@ -43,14 +42,19 @@ public class ConversationServiceImpl implements ConversationService {
     @Autowired
     private KafkaTemplate<String, ChatCreatedEvent> kafkaTemplate;
 
+    private final ParentAIClient parentAIClient;
+
+
     public ConversationServiceImpl(ConversationRepository conversationRepository,
                                    MessageRepository messageRepository,
                                    WebClient.Builder webClientBuilder,
-                                   ObjectMapper objectMapper) {
+                                   ObjectMapper objectMapper,
+                                   ParentAIClient parentAIClient) {
         this.conversationRepository = conversationRepository;
         this.messageRepository = messageRepository;
         this.webClient = webClientBuilder.build();
         this.objectMapper = objectMapper;
+        this.parentAIClient = parentAIClient;
     }
 
     @Override
@@ -80,19 +84,11 @@ public class ConversationServiceImpl implements ConversationService {
             if (title == null || title.trim().isEmpty()) conversationDTO.setTitle("Conversation");
             else conversationDTO.setTitle(title.trim());
 
-            //DTO -> Entity
             Conversation entity = ConversationMapper.toEntity(conversationDTO);
 
-            // Ensure new entity (ignore id from client)
             entity.setId(null);
             if (entity.getCreatedAt() == null) entity.setCreatedAt(Instant.now());
-
-            if (entity.getMessages() != null) {
-                for (Message m : entity.getMessages()) {
-                    m.setConversation(entity);
-                    if (m.getCreatedAt() == null) m.setCreatedAt(Instant.now());
-                }
-            }
+            if (entity.getMessages() == null) entity.setMessages(new java.util.ArrayList<>());
 
             Conversation saved = conversationRepository.save(entity);
 
@@ -103,9 +99,7 @@ public class ConversationServiceImpl implements ConversationService {
                 logger.warn("Failed to publish chat.created event for convId={} : {}", saved.getId(), e.getMessage(), e);
             }
 
-            //entity -> DTO
-            ConversationDTO out = ConversationMapper.toDto(saved);
-            return out;
+            return ConversationMapper.toDto(saved);
 
         } catch (DataAccessException dae) {
             logger.error("DB error while creating conversation for userId={} : {}", userId, dae.getMessage(), dae);
@@ -145,49 +139,30 @@ public class ConversationServiceImpl implements ConversationService {
     private Conversation ensureConversation(Long userId, Long convId, String titleIfNew) {
         if (convId != null) {
             Optional<Conversation> maybe = conversationRepository.findById(convId);
-            if (maybe.isPresent()) return maybe.get();
+            if (maybe.isPresent()) {
+                Conversation existing = maybe.get();
+                if (existing.getMessages() == null) {
+                    existing.setMessages(new java.util.ArrayList<>());
+                }
+                return existing;
+            }
         }
         Conversation c = new Conversation(userId, titleIfNew != null ? titleIfNew : "Conversation");
         if (c.getCreatedAt() == null) c.setCreatedAt(Instant.now());
+        // init messages list
+        if (c.getMessages() == null) c.setMessages(new java.util.ArrayList<>());
         return conversationRepository.save(c);
     }
 
-    private String callPython(String message) {
-        String pythonUrl = System.getenv().getOrDefault("PYTHON_SERVICE_URL", "http://localhost:8000/chat");
-        try {
-            String raw = webClient.post()
-                    .uri(pythonUrl)
-                    .header("Content-Type", "application/json")
-                    .bodyValue(Map.of("message", message))
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
-
-            if (raw == null) return "empty upstream response";
-
-            try {
-                JsonNode node = objectMapper.readTree(raw);
-                if (node.has("reply")) return node.get("reply").asText();
-                if (node.has("hf_response") && node.get("hf_response").has("generated_text"))
-                    return node.get("hf_response").get("generated_text").asText();
-            } catch (Exception ex) {
-                // fallback to raw
-            }
-            return raw;
-        } catch (Exception e) {
-            logger.error("Error calling python service at {} : {}", pythonUrl, e.getMessage(), e);
-            throw new RuntimeException("python call failed: " + e.getMessage(), e);
-        }
-    }
-
     @Override
+    @Transactional
     public MessageDTO sendMessage(Long userId, Long conversationId, String text) {
         if (userId == null) throw new IllegalArgumentException("userId must be provided");
         if (text == null || text.trim().isEmpty()) throw new IllegalArgumentException("empty message");
 
-        // if conversationId null -> create new
         Conversation conv = ensureConversation(userId, conversationId, null);
         if (!userId.equals(conv.getUserId())) throw new IllegalArgumentException("forbidden");
+        if (conv.getMessages() == null) conv.setMessages(new java.util.ArrayList<>());
 
         // 1) save user message
         Message userMsg = new Message("user", text, Instant.now());
@@ -196,8 +171,7 @@ public class ConversationServiceImpl implements ConversationService {
         Message savedUserMsg;
         try {
             savedUserMsg = messageRepository.save(userMsg);
-            // ensure conv relationship persisted
-            if (!conv.getMessages().contains(savedUserMsg)) {
+            if (conv.getMessages().stream().noneMatch(m -> m.getId() != null && m.getId().equals(savedUserMsg.getId()))) {
                 conv.getMessages().add(savedUserMsg);
                 conversationRepository.save(conv);
             }
@@ -206,12 +180,11 @@ public class ConversationServiceImpl implements ConversationService {
             throw new RuntimeException("Database error saving message", dae);
         }
 
-        // 2) call python upstream and capture raw response
-        String rawUpstream;
+        // 2) call Python LLM proxy via ParentAIClient
+        HFChatResponse aiResp;
         try {
-            rawUpstream = callPython(text);
+            aiResp = parentAIClient.chat(text, 200, 0.7);
         } catch (RuntimeException e) {
-            // mark user message as failed by appending tag (since no status field)
             try {
                 savedUserMsg.setText(savedUserMsg.getText() + " [FAILED: upstream]");
                 messageRepository.save(savedUserMsg);
@@ -222,33 +195,15 @@ public class ConversationServiceImpl implements ConversationService {
             throw new RuntimeException("Upstream error: " + e.getMessage(), e);
         }
 
-        // 3) parse upstream, extract best candidate reply and metadata
-        String botText = rawUpstream;
+        // 3) extract reply/model/metadata
+        String botText = (aiResp != null && aiResp.getReply() != null) ? aiResp.getReply() : "(no reply)";
+        String model = (aiResp != null) ? aiResp.getModel() : null;
         String metadataJson = null;
-        String model = null;
         try {
-            JsonNode root = objectMapper.readTree(rawUpstream);
-            // heuristics: pick known fields if present
-            if (root.has("reply")) {
-                botText = root.get("reply").asText();
-            } else if (root.has("hf_response") && root.get("hf_response").has("generated_text")) {
-                botText = root.get("hf_response").get("generated_text").asText();
-            } else if (root.has("generated_text")) {
-                botText = root.get("generated_text").asText();
-            } else {
-                // leave botText as rawUpstream (string)
+            if (aiResp != null && aiResp.getRaw() != null) {
+                metadataJson = objectMapper.writeValueAsString(aiResp.getRaw());
             }
-            // keep raw JSON as metadata
-            metadataJson = root.toString();
-
-            // optional model detection
-            if (root.has("model")) model = root.get("model").asText();
-            // also check nested structures
-            if (model == null && root.has("meta") && root.get("meta").has("model")) model = root.get("meta").get("model").asText();
-        } catch (Exception ex) {
-            // not JSON — raw text reply, metadata stays null
-            metadataJson = null;
-        }
+        } catch (Exception ignore) {}
 
         // 4) save bot message including metadata
         Message botMsg = new Message();
@@ -263,7 +218,7 @@ public class ConversationServiceImpl implements ConversationService {
         Message savedBotMsg;
         try {
             savedBotMsg = messageRepository.save(botMsg);
-            if (!conv.getMessages().contains(savedBotMsg)) {
+            if (conv.getMessages().stream().noneMatch(m -> m.getId() != null && m.getId().equals(savedBotMsg.getId()))) {
                 conv.getMessages().add(savedBotMsg);
                 conversationRepository.save(conv);
             }
@@ -275,6 +230,7 @@ public class ConversationServiceImpl implements ConversationService {
 
         return ConversationMapper.toMessageDto(savedBotMsg);
     }
+
 
     @Override
     public MessageDTO legacyChat(Long userId, String text) {
